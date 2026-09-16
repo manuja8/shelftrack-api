@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - dev
+
   workflow_dispatch:
 
 permissions:
@@ -21,25 +22,41 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ---------------------------------------------------------
+      # 1. Checkout source code
+      # ---------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
+      # ---------------------------------------------------------
+      # 2. Set up Python
+      # ---------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
+      # ---------------------------------------------------------
+      # 3. Create log directory
+      # ---------------------------------------------------------
       - name: Prepare CI log directory
         shell: bash
-        run: mkdir -p ci-logs
+        run: |
+          mkdir -p ci-logs
 
+      # ---------------------------------------------------------
+      # 4. Collect real Git metadata
+      # ---------------------------------------------------------
       - name: Collect repository metadata
         id: metadata
         shell: bash
         run: |
-          FILES_CHANGED=$(git diff --name-only HEAD^ HEAD 2>/dev/null | sed '/^$/d' | wc -l | xargs)
+          FILES_CHANGED=$(git diff --name-only HEAD^ HEAD 2>/dev/null \
+            | sed '/^$/d' \
+            | wc -l \
+            | xargs)
 
           COMMIT_SIZE=$(git diff --numstat HEAD^ HEAD 2>/dev/null | awk '
           {
@@ -52,9 +69,16 @@ jobs:
 
           echo "files_changed=$FILES_CHANGED" >> "$GITHUB_OUTPUT"
           echo "commit_size=$COMMIT_SIZE" >> "$GITHUB_OUTPUT"
+
           echo "Files changed: $FILES_CHANGED"
           echo "Commit size: $COMMIT_SIZE"
 
+      # ---------------------------------------------------------
+      # 5. Install real application dependencies
+      #
+      # If requirements.txt contains a genuine dependency
+      # conflict, pip itself will fail and its real log is saved.
+      # ---------------------------------------------------------
       - name: Install application dependencies
         id: dependencies
         shell: bash
@@ -62,8 +86,14 @@ jobs:
           START_TIME=$(date +%s)
 
           set +e
-          python -m pip install --disable-pip-version-check -r requirements.txt > ci-logs/dependency.log 2>&1
+
+          python -m pip install \
+            --disable-pip-version-check \
+            -r requirements.txt \
+            > ci-logs/dependency.log 2>&1
+
           EXIT_CODE=$?
+
           set -e
 
           END_TIME=$(date +%s)
@@ -76,28 +106,39 @@ jobs:
             echo "Dependency installation passed."
           else
             echo "Dependency installation failed with a real pip error."
-            tail -n 80 ci-logs/dependency.log
+            tail -n 100 ci-logs/dependency.log
           fi
 
-          # Do not exit here. The real log still needs to be sent to DeployPilot.
+          # Do not stop here.
+          # DeployPilot still needs to receive the real failure log.
           exit 0
 
+      # ---------------------------------------------------------
+      # 6. Validate application configuration
+      # ---------------------------------------------------------
       - name: Validate application configuration
         id: config
         shell: bash
         run: |
           if [ "${{ steps.dependencies.outputs.exit_code }}" != "0" ]; then
-            echo "Dependency stage failed, so configuration validation is skipped." > ci-logs/config.log
+            echo "Dependency stage failed, so configuration validation is skipped." \
+              > ci-logs/config.log
+
             echo "exit_code=0" >> "$GITHUB_OUTPUT"
             echo "duration=0" >> "$GITHUB_OUTPUT"
+
             exit 0
           fi
 
           START_TIME=$(date +%s)
 
           set +e
-          python scripts/check_config.py > ci-logs/config.log 2>&1
+
+          python scripts/check_config.py \
+            > ci-logs/config.log 2>&1
+
           EXIT_CODE=$?
+
           set -e
 
           END_TIME=$(date +%s)
@@ -107,6 +148,7 @@ jobs:
           echo "duration=$DURATION" >> "$GITHUB_OUTPUT"
 
           if [ "$EXIT_CODE" -eq 0 ]; then
+            echo "Configuration validation passed."
             cat ci-logs/config.log
           else
             echo "Configuration validation failed."
@@ -115,36 +157,55 @@ jobs:
 
           exit 0
 
+      # ---------------------------------------------------------
+      # 7. Run real pytest tests
+      # ---------------------------------------------------------
       - name: Run automated tests
         id: tests
         shell: bash
         run: |
-          if [ "${{ steps.dependencies.outputs.exit_code }}" != "0" ] || [ "${{ steps.config.outputs.exit_code }}" != "0" ]; then
-            echo "Earlier CI stage failed, so tests are skipped." > ci-logs/tests.log
+          if [ "${{ steps.dependencies.outputs.exit_code }}" != "0" ] || \
+             [ "${{ steps.config.outputs.exit_code }}" != "0" ]; then
+
+            echo "Earlier CI stage failed, so tests are skipped." \
+              > ci-logs/tests.log
+
             echo "exit_code=0" >> "$GITHUB_OUTPUT"
             echo "tests_failed=0" >> "$GITHUB_OUTPUT"
             echo "duration=0" >> "$GITHUB_OUTPUT"
+
             exit 0
           fi
 
           START_TIME=$(date +%s)
 
           set +e
-          python -m pytest -q > ci-logs/tests.log 2>&1
+
+          python -m pytest -q \
+            > ci-logs/tests.log 2>&1
+
           EXIT_CODE=$?
+
           set -e
 
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - START_TIME))
 
           TESTS_FAILED=0
+
           if [ "$EXIT_CODE" -ne 0 ]; then
             TESTS_FAILED=$(python - <<'PY'
           import re
           from pathlib import Path
 
           text = Path("ci-logs/tests.log").read_text(errors="ignore")
-          matches = re.findall(r"(\d+) failed", text)
+
+          matches = re.findall(
+              r"(\d+)\s+failed",
+              text,
+              flags=re.IGNORECASE,
+          )
+
           print(matches[-1] if matches else "1")
           PY
             )
@@ -155,14 +216,18 @@ jobs:
           echo "duration=$DURATION" >> "$GITHUB_OUTPUT"
 
           if [ "$EXIT_CODE" -eq 0 ]; then
+            echo "Automated tests passed."
             cat ci-logs/tests.log
           else
             echo "Automated tests failed."
-            tail -n 100 ci-logs/tests.log
+            tail -n 120 ci-logs/tests.log
           fi
 
           exit 0
 
+      # ---------------------------------------------------------
+      # 8. Collect real GitHub runner metrics
+      # ---------------------------------------------------------
       - name: Collect runner metrics
         id: runner
         shell: bash
@@ -172,27 +237,47 @@ jobs:
 
           load = os.getloadavg()[0]
           cpus = os.cpu_count() or 1
-          print(round(min(100, (load / cpus) * 100), 2))
+
+          usage = min(
+              100,
+              (load / cpus) * 100,
+          )
+
+          print(round(usage, 2))
           PY
           )
 
           MEMORY_USAGE=$(python - <<'PY'
           values = {}
+
           with open("/proc/meminfo", "r") as file:
               for line in file:
                   key, value = line.split(":", 1)
-                  values[key] = int(value.strip().split()[0])
 
-          used_mb = (values["MemTotal"] - values["MemAvailable"]) / 1024
+                  values[key] = int(
+                      value.strip().split()[0]
+                  )
+
+          total = values["MemTotal"]
+          available = values["MemAvailable"]
+
+          used_mb = (
+              total - available
+          ) / 1024
+
           print(round(used_mb, 2))
           PY
           )
 
           echo "cpu_usage=$CPU_USAGE" >> "$GITHUB_OUTPUT"
           echo "memory_usage=$MEMORY_USAGE" >> "$GITHUB_OUTPUT"
+
           echo "CPU usage: $CPU_USAGE%"
           echo "Memory usage: $MEMORY_USAGE MB"
 
+      # ---------------------------------------------------------
+      # 9. Check that hosted ML models are available
+      # ---------------------------------------------------------
       - name: Verify hosted DeployPilot models
         shell: bash
         run: |
@@ -204,42 +289,70 @@ jobs:
             "$DEPLOYPILOT_API_URL/model-status")
 
           if [ "$HTTP_STATUS" != "200" ]; then
-            echo "DeployPilot model-status request failed with HTTP $HTTP_STATUS."
+            echo "::error::DeployPilot model-status request failed with HTTP $HTTP_STATUS."
+
             cat deploypilot-model-status.json
+
             exit 1
           fi
 
           python - <<'PY'
           import json
 
-          with open("deploypilot-model-status.json", "r") as file:
+          with open(
+              "deploypilot-model-status.json",
+              "r",
+          ) as file:
               data = json.load(file)
 
           print(json.dumps(data, indent=2))
 
-          if not data.get("failure_risk_model_loaded") or not data.get("failure_type_classifier_loaded"):
-              raise SystemExit("One or more deployed models are not loaded.")
+          if not data.get("failure_risk_model_loaded"):
+              raise SystemExit(
+                  "Failure risk model is not loaded."
+              )
+
+          if not data.get("failure_type_classifier_loaded"):
+              raise SystemExit(
+                  "Failure type classifier is not loaded."
+              )
           PY
 
+      # ---------------------------------------------------------
+      # 10. Create prediction request using REAL CI results
+      # ---------------------------------------------------------
       - name: Create prediction request from real CI results
         id: request
         shell: bash
         env:
           PIPELINE_ID: ${{ github.workflow }}
-          RUN_ID: ${{ github.run_id }}
+
+          # Important:
+          # github.run_id remains the same during "Re-run jobs".
+          # github.run_attempt changes.
+          #
+          # Combining both gives each attempt its own history ID.
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+
           REPOSITORY: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
+
           COMMIT_SIZE: ${{ steps.metadata.outputs.commit_size }}
           FILES_CHANGED: ${{ steps.metadata.outputs.files_changed }}
+
           DEPENDENCY_EXIT_CODE: ${{ steps.dependencies.outputs.exit_code }}
           DEPENDENCY_DURATION: ${{ steps.dependencies.outputs.duration }}
+
           CONFIG_EXIT_CODE: ${{ steps.config.outputs.exit_code }}
           CONFIG_DURATION: ${{ steps.config.outputs.duration }}
+
           TEST_EXIT_CODE: ${{ steps.tests.outputs.exit_code }}
           TESTS_FAILED: ${{ steps.tests.outputs.tests_failed }}
           TEST_DURATION: ${{ steps.tests.outputs.duration }}
+
           CPU_USAGE: ${{ steps.runner.outputs.cpu_usage }}
           MEMORY_USAGE: ${{ steps.runner.outputs.memory_usage }}
+
         run: |
           python - <<'PY'
           import json
@@ -249,6 +362,7 @@ jobs:
 
           def as_int(name, default=0):
               value = os.getenv(name, "")
+
               try:
                   return int(value)
               except (TypeError, ValueError):
@@ -257,85 +371,193 @@ jobs:
 
           def as_float(name, default=0.0):
               value = os.getenv(name, "")
+
               try:
                   return float(value)
               except (TypeError, ValueError):
                   return default
 
 
-          dependency_exit = as_int("DEPENDENCY_EXIT_CODE")
-          config_exit = as_int("CONFIG_EXIT_CODE")
-          test_exit = as_int("TEST_EXIT_CODE")
+          dependency_exit = as_int(
+              "DEPENDENCY_EXIT_CODE"
+          )
+
+          config_exit = as_int(
+              "CONFIG_EXIT_CODE"
+          )
+
+          test_exit = as_int(
+              "TEST_EXIT_CODE"
+          )
 
           failed_log = ""
           failed_stage = "none"
 
+          # Select the first REAL CI stage that failed.
           if dependency_exit != 0:
               failed_stage = "dependency"
-              log_path = Path("ci-logs/dependency.log")
+              log_path = Path(
+                  "ci-logs/dependency.log"
+              )
+
           elif config_exit != 0:
               failed_stage = "configuration"
-              log_path = Path("ci-logs/config.log")
+              log_path = Path(
+                  "ci-logs/config.log"
+              )
+
           elif test_exit != 0:
               failed_stage = "test"
-              log_path = Path("ci-logs/tests.log")
+              log_path = Path(
+                  "ci-logs/tests.log"
+              )
+
           else:
               log_path = None
 
-          if log_path and log_path.exists():
-              failed_log = log_path.read_text(errors="ignore")[-12000:]
 
-          actual_result = "FAIL" if failed_stage != "none" else "PASS"
+          # Only send an error log when something really failed.
+          if log_path and log_path.exists():
+              failed_log = log_path.read_text(
+                  errors="ignore"
+              )[-12000:]
+
+
+          actual_result = (
+              "FAIL"
+              if failed_stage != "none"
+              else "PASS"
+          )
+
 
           payload = {
               "pipeline_id": os.environ["PIPELINE_ID"],
               "run_id": os.environ["RUN_ID"],
+
               "ci_tool": "GitHub Actions",
               "repository": os.environ["REPOSITORY"],
               "branch": os.environ["BRANCH"],
-              "commit_size": as_int("COMMIT_SIZE"),
-              "files_changed": as_int("FILES_CHANGED"),
+
+              "commit_size": as_int(
+                  "COMMIT_SIZE"
+              ),
+
+              "files_changed": as_int(
+                  "FILES_CHANGED"
+              ),
+
               "warnings": 0,
-              "tests_failed": as_int("TESTS_FAILED"),
-              "build_duration_sec": as_float("DEPENDENCY_DURATION") + as_float("CONFIG_DURATION"),
-              "test_duration_sec": as_float("TEST_DURATION"),
+
+              "tests_failed": as_int(
+                  "TESTS_FAILED"
+              ),
+
+              "build_duration_sec": (
+                  as_float("DEPENDENCY_DURATION")
+                  + as_float("CONFIG_DURATION")
+              ),
+
+              "test_duration_sec": as_float(
+                  "TEST_DURATION"
+              ),
+
               "deploy_duration_sec": 0,
-              "cpu_usage_pct": as_float("CPU_USAGE"),
-              "memory_usage_mb": as_float("MEMORY_USAGE"),
+
+              "cpu_usage_pct": as_float(
+                  "CPU_USAGE"
+              ),
+
+              "memory_usage_mb": as_float(
+                  "MEMORY_USAGE"
+              ),
+
               "retry_count": 0,
+
+              # The hosted /github/predict endpoint replaces this
+              # with repository history calculated by the backend.
               "previous_failure_rate": 0,
+
               "language": "Python",
               "os": "ubuntu-latest",
               "cloud_provider": "GitHub Hosted",
+
               "error_log": failed_log,
+
               "quality_gate_enabled": True,
+
               "actual_result": actual_result,
           }
 
-          print(f"Real failed stage: {failed_stage}")
-          print(f"Actual CI result: {actual_result}")
+
+          print(
+              f"Run ID: {os.environ['RUN_ID']}"
+          )
+
+          print(
+              f"Real failed stage: {failed_stage}"
+          )
+
+          print(
+              f"Actual CI result: {actual_result}"
+          )
+
+
           if failed_log:
-              print("Captured real CI log preview:")
-              print(failed_log[-1500:])
+              print(
+                  "Captured real CI error log:"
+              )
 
-          with open("deploypilot-request.json", "w") as file:
-              json.dump(payload, file, indent=2)
+              print(
+                  failed_log[-2000:]
+              )
 
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"actual_result={actual_result}\n")
-              output.write(f"failed_stage={failed_stage}\n")
+          else:
+              print(
+                  "No real CI error log because the CI checks passed."
+              )
+
+
+          with open(
+              "deploypilot-request.json",
+              "w",
+          ) as file:
+              json.dump(
+                  payload,
+                  file,
+                  indent=2,
+              )
+
+
+          with open(
+              os.environ["GITHUB_OUTPUT"],
+              "a",
+          ) as output:
+
+              output.write(
+                  f"actual_result={actual_result}\n"
+              )
+
+              output.write(
+                  f"failed_stage={failed_stage}\n"
+              )
           PY
 
+      # ---------------------------------------------------------
+      # 11. Send result to hosted DeployPilot API
+      # ---------------------------------------------------------
       - name: Send real CI result to hosted DeployPilot API
         id: deploypilot
         shell: bash
         env:
           DEPLOYPILOT_API_KEY: ${{ secrets.DEPLOYPILOT_API_KEY }}
+
         run: |
           if [ -z "$DEPLOYPILOT_API_KEY" ]; then
-            echo "::error::GitHub secret DEPLOYPILOT_API_KEY is not configured in this repository."
+            echo "::error::GitHub secret DEPLOYPILOT_API_KEY is not configured."
+
             exit 1
           fi
+
 
           HTTP_STATUS=$(curl \
             --silent \
@@ -348,77 +570,194 @@ jobs:
             --header "X-API-Key: $DEPLOYPILOT_API_KEY" \
             --data @deploypilot-request.json)
 
+
           echo "DeployPilot API HTTP status: $HTTP_STATUS"
 
+
           if [ "$HTTP_STATUS" != "200" ]; then
-            echo "DeployPilot API request failed."
+            echo "::error::DeployPilot API request failed."
+
             cat deploypilot-response.json
+
             exit 1
           fi
+
 
           python - <<'PY'
           import json
 
-          with open("deploypilot-response.json", "r") as file:
+          with open(
+              "deploypilot-response.json",
+              "r",
+          ) as file:
               data = json.load(file)
 
           print("DeployPilot prediction:")
-          print(json.dumps(data, indent=2))
+
+          print(
+              json.dumps(
+                  data,
+                  indent=2,
+              )
+          )
           PY
 
-      - name: Publish result summary and enforce real CI result
+      # ---------------------------------------------------------
+      # 12. Publish GitHub summary
+      # ---------------------------------------------------------
+      - name: Publish result summary and enforce quality gate
         shell: bash
         env:
           ACTUAL_RESULT: ${{ steps.request.outputs.actual_result }}
           FAILED_STAGE: ${{ steps.request.outputs.failed_stage }}
+
         run: |
           python - <<'PY'
           import json
           import os
 
-          with open("deploypilot-response.json", "r") as file:
+
+          with open(
+              "deploypilot-response.json",
+              "r",
+          ) as file:
               result = json.load(file)
 
+
+          actual_result = os.environ.get(
+              "ACTUAL_RESULT",
+              "UNKNOWN",
+          )
+
+          failed_stage = os.environ.get(
+              "FAILED_STAGE",
+              "unknown",
+          )
+
+
+          failure_type = result.get(
+              "failure_type"
+          )
+
+          # Make a passed run easier to understand.
+          if actual_result == "PASS":
+              failure_type = "N/A - no CI failure"
+
+
           values = {
-              "Actual CI Result": os.environ.get("ACTUAL_RESULT", "UNKNOWN"),
-              "Real Failed Stage": os.environ.get("FAILED_STAGE", "unknown"),
-              "Prediction": result.get("prediction"),
-              "Risk Score": result.get("risk_score"),
-              "Risk Level": result.get("risk_level"),
-              "Failure Type": result.get("failure_type"),
-              "Quality Gate": result.get("quality_gate_action"),
-              "Gate Mode": result.get("gate_mode"),
-              "Cold Start": result.get("cold_start"),
-              "Meaningful History Runs": result.get("meaningful_history_runs"),
+              "Actual CI Result": actual_result,
+
+              "Real Failed Stage": failed_stage,
+
+              "Prediction": result.get(
+                  "prediction"
+              ),
+
+              "Risk Score": result.get(
+                  "risk_score"
+              ),
+
+              "Previous Failure Rate Used": result.get(
+                  "previous_failure_rate_used"
+              ),
+
+              "Risk Level": result.get(
+                  "risk_level"
+              ),
+
+              "Failure Type": failure_type,
+
+              "Quality Gate": result.get(
+                  "quality_gate_action"
+              ),
+
+              "Gate Mode": result.get(
+                  "gate_mode"
+              ),
+
+              "Cold Start": result.get(
+                  "cold_start"
+              ),
+
+              "Meaningful History Runs": result.get(
+                  "meaningful_history_runs"
+              ),
           }
 
-          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
-          with open(summary_path, "a") as summary:
-              summary.write("## ShelfTrack CI + DeployPilot Result\n\n")
-              summary.write("| Result | Value |\n")
-              summary.write("|---|---|\n")
+
+          summary_path = os.environ[
+              "GITHUB_STEP_SUMMARY"
+          ]
+
+
+          with open(
+              summary_path,
+              "a",
+          ) as summary:
+
+              summary.write(
+                  "## ShelfTrack CI + DeployPilot Result\n\n"
+              )
+
+              summary.write(
+                  "| Result | Value |\n"
+              )
+
+              summary.write(
+                  "|---|---|\n"
+              )
+
               for key, value in values.items():
-                  summary.write(f"| {key} | {value} |\n")
+                  summary.write(
+                      f"| {key} | {value} |\n"
+                  )
           PY
+
 
           ACTION=$(python - <<'PY'
           import json
-          print(json.load(open("deploypilot-response.json"))["quality_gate_action"])
+
+          with open(
+              "deploypilot-response.json",
+              "r",
+          ) as file:
+              data = json.load(file)
+
+          print(
+              data.get(
+                  "quality_gate_action",
+                  "UNKNOWN",
+              )
+          )
           PY
           )
 
+
+          echo "Actual CI Result: $ACTUAL_RESULT"
+          echo "Real Failed Stage: $FAILED_STAGE"
+          echo "DeployPilot Quality Gate: $ACTION"
+
+
+          # A real CI failure always fails the workflow.
           if [ "$ACTUAL_RESULT" = "FAIL" ]; then
             echo "::error::The real ShelfTrack CI run failed at stage: $FAILED_STAGE"
+
             exit 1
           fi
 
+
+          # If CI passed but the trained AI risk model blocks it,
+          # enforce the DeployPilot quality gate.
           if [ "$ACTION" = "BLOCK" ]; then
-            echo "::error::DeployPilot AI blocked the pipeline based on predicted risk."
+            echo "::error::Real CI checks passed, but DeployPilot AI blocked the pipeline based on predicted risk."
+
             exit 1
           fi
+
 
           if [ "$ACTION" = "WARN" ]; then
-            echo "::warning::DeployPilot AI returned a warning, but the real CI checks passed."
+            echo "::warning::Real CI checks passed. DeployPilot returned a warning."
+
           else
             echo "Real CI checks passed and DeployPilot allowed the pipeline."
           fi

@@ -1,1 +1,1 @@
-"""ShelfTrack application package."""
+"""ShelfTrack application packages."""

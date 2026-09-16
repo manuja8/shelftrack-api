@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+*.pyc
+ci-logs/
+deploypilot-request.json
+deploypilot-response.json
